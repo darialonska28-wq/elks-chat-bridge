@@ -4,30 +4,23 @@ const app = express();
 
 app.use(express.json());
 
-// Дозволяємо доступ з будь-якого сайту
-app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    next();
-});
+// Тимчасове сховище у пам'яті сервера
+const sessions = new Map();
+if (!global.pendingMessages) {
+    global.pendingMessages = new Map();
+}
 
-const BOT_TOKEN = "8989392795:AAFcrP0aSaSX6XuQhGh62pXbrYFH8pU0d1w";
-const ADMIN_CHAT_ID = "8691137994";
-let lastAdminReply = null;
+const BOT_TOKEN = process.env.BOT_TOKEN || "8989392795:AAFcrP0aSaSX6XuQhGh62pXbrYFH8pU0d1w";
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "8691137994";
 
-// Головна сторінка — щоб не було "Cannot GET /"
-app.get('/', (req, res) => {
-    res.send('EL-Księgowość Chat Bridge is active!');
-});
-
-// 1. Отримання повідомлення з сайту і перенаправлення в Telegram
+// 1. Прийом повідомлення з сайту -> надсилання в Telegram
 app.post('/api/send-from-site', async (req, res) => {
     try {
-        const { message, clientName } = req.body;
+        const { message, clientId, clientName } = req.body;
         if (!message) return res.status(400).json({ error: 'Message is required' });
 
-        const text = `💬 <b>Нове повідомлення в чаті сайту!</b>\n\n👤 Клієнт: <b>${clientName || 'Гість'}</b>\n📝 Повідомлення:\n${message}\n\n<i>⚠️ Натисни «Reply» (Відповісти), щоб написати клієнту!</i>`;
+        const sessionId = clientId || 'guest_' + Date.now();
+        const text = `💬 <b>Нове повідомлення в чаті сайту!</b>\n\n👤 Клієнт: <b>${clientName || 'Клієнт'}</b>\n📝 Повідомлення:\n${message}\n\n<i>⚠️ Натисни «Reply» (Відповісти), щоб відповісти клієнту!</i>`;
 
         const tgResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -41,9 +34,10 @@ app.post('/api/send-from-site', async (req, res) => {
 
         const tgData = await tgResponse.json();
         if (tgData.ok) {
-            return res.json({ success: true });
+            sessions.set(tgData.result.message_id, sessionId);
+            return res.json({ success: true, sessionId });
         } else {
-            return res.status(500).json({ error: 'Telegram error', details: tgData });
+            return res.status(500).json({ error: 'Telegram API error', details: tgData });
         }
     } catch (err) {
         console.error(err);
@@ -51,30 +45,46 @@ app.post('/api/send-from-site', async (req, res) => {
     }
 });
 
-// 2. Отримання відповіді від тебе з Telegram (через Reply)
+// 2. Webhook від Telegram: коли ти відповідаєш у Telegram через Reply
 app.post('/api/telegram-webhook', async (req, res) => {
     try {
         const update = req.body;
         if (update.message && update.message.reply_to_message && update.message.text) {
-            lastAdminReply = update.message.text;
+            const replyToId = update.message.reply_to_message.message_id;
+            const adminReplyText = update.message.text;
+
+            const sessionId = sessions.get(replyToId);
+            if (sessionId) {
+                if (!global.pendingMessages.has(sessionId)) {
+                    global.pendingMessages.set(sessionId, []);
+                }
+                global.pendingMessages.get(sessionId).push(adminReplyText);
+            }
         }
         res.status(200).send('OK');
     } catch (err) {
+        console.error(err);
         res.status(500).send('Error');
     }
 });
 
-// 3. Сайт перевіряє, чи є відповідь від тебе
-app.get('/api/check-messages', (req, res) => {
-    if (lastAdminReply) {
-        const reply = lastAdminReply;
-        lastAdminReply = null; // очищуємо після відправки на сайт
-        return res.json({ messages: [reply] });
+// 3. Перевірка нових повідомлень сайтом
+app.get('/api/check-messages/:sessionId', (req, res) => {
+    const sessionId = req.params.sessionId;
+    if (global.pendingMessages.has(sessionId)) {
+        const messages = global.pendingMessages.get(sessionId);
+        global.pendingMessages.delete(sessionId);
+        return res.json({ messages });
     }
     return res.json({ messages: [] });
 });
 
+// Тестовий маршрут, щоб перевірити, чи живий сервер
+app.get('/', (req, res) => {
+    res.json({ status: "EL-Księgowość Chat Bridge is running!" });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Bridge server is running on port ${PORT}`);
 });
