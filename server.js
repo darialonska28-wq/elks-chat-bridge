@@ -1,98 +1,220 @@
-const express = require('express');
-const fetch = require('node-fetch');
+
+const express = require("express");
 const app = express();
 
-app.use(express.json());
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID || "8691137994";
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+const SETUP_KEY = process.env.SETUP_KEY;
+const SITE_ORIGIN =
+  process.env.SITE_ORIGIN || "https://xn--el-ksigowo-zhb5s46a.pl";
 
-const sessions = new Map();
-if (!global.pendingMessages) {
-    global.pendingMessages = new Map();
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin === SITE_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+app.use(express.json({ limit: "20kb" }));
+
+// Тимчасова черга відповідей.
+// Для постійного збереження після перезапуску потрібна база даних.
+const pendingMessages = new Map();
+
+function validSessionId(value) {
+  return typeof value === "string" &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(value);
 }
 
-// 1. Прийом повідомлення з сайту -> надсилання в Telegram
-app.post('/api/send-from-site', async (req, res) => {
-    try {
-        const { message, clientId, clientName } = req.body;
-        if (!message) return res.status(400).json({ error: 'Message is required' });
+async function telegram(method, body) {
+  if (!BOT_TOKEN) {
+    throw new Error("BOT_TOKEN is not configured");
+  }
 
-        const sessionId = clientId || 'guest_' + Date.now();
-        const text = `💬 <b>Нове повідомлення в чаті сайту!</b>\n\n👤 Клієнт: <b>${clientName || 'Клієнт'}</b>\n🔑 Сесія: <code>${sessionId}</code>\n📝 Повідомлення:\n${text || message}\n\n<i>⚠️ Натисни «Reply» (Відповісти), щоб відповісти!</i>`;
-
-        // Виправляємо дрібницю зі змінною тексту
-        const tgText = `💬 <b>Нове повідомлення в чаті сайту!</b>\n\n👤 Клієнт: <b>${clientName || 'Клієнт'}</b>\n🔑 Сесія: <code>${sessionId}</code>\n📝 Повідомлення:\n${message}\n\n<i>⚠️ Натисни «Reply» (Відповісти), щоб відповісти!</i>`;
-
-        const tgResponse = await fetch(`https://api.telegram.org/bot8989392795:AAFcrP0aSaSX6XuQhGh62pXbrYFH8pU0d1w/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: "8691137994",
-                text: tgText,
-                parse_mode: 'HTML'
-            })
-        });
-
-        const tgData = await tgResponse.json();
-        if (tgData.ok) {
-            sessions.set(tgData.result.message_id, sessionId);
-            console.log(`✅ Повідомлено Telegram. Зв'язано message_id ${tgData.result.message_id} з сесією ${sessionId}`);
-            return res.json({ success: true, sessionId });
-        } else {
-            console.log('❌ Помилка Telegram API:', tgData);
-            return res.status(500).json({ error: 'Telegram API error' });
-        }
-    } catch (err) {
-        console.error('❌ Помилка сервера /api/send-from-site:', err);
-        res.status(500).json({ error: 'Server error' });
+  const response = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
     }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error("Telegram API request failed");
+  }
+
+  return data.result;
+}
+
+// 1. Сайт -> Telegram
+app.post("/api/send-from-site", async (req, res) => {
+  try {
+    const message = String(req.body.message || "").trim();
+    const sessionId = String(req.body.clientId || "");
+    const clientName = String(req.body.clientName || "Клієнт")
+      .replace(/[\r\n]/g, " ")
+      .slice(0, 100);
+
+    if (!message || message.length > 4000 ||
+        !validSessionId(sessionId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid message or session"
+      });
+    }
+
+    const telegramMessage =
+      `💬 Нове повідомлення в чаті EL-Księgowość\n\n` +
+      `👤 Клієнт: ${clientName}\n` +
+      `📝 Повідомлення:\n${message}\n\n` +
+      `[SID:${sessionId}]\n\n` +
+      `↩️ Натисніть «Відповісти» саме на це повідомлення.`;
+
+    await telegram("sendMessage", {
+      chat_id: CHAT_ID,
+      text: telegramMessage
+    });
+
+    return res.json({ success: true, sessionId });
+  } catch (error) {
+    console.error("send-from-site error:", error.message);
+
+    return res.status(502).json({
+      success: false,
+      error: "Не вдалося надіслати повідомлення"
+    });
+  }
 });
 
-// 2. ВЕБХУК ВІД TELEGRAM (З ПОВНИМ ЛОГУВАННЯМ)
-app.post('/api/telegram-webhook', async (req, res) => {
-    console.gn = console.log;
-    console.log('🔔 ОТРИМАНО ЗАПИТ ВІД TELEGRAM WEBHOOK:', JSON.stringify(req.body, null, 2));
+// 2. Відповідь адміністратора з Telegram -> черга клієнта
+app.post("/api/telegram-webhook", async (req, res) => {
+  if (!WEBHOOK_SECRET ||
+      req.get("X-Telegram-Bot-Api-Secret-Token") !== WEBHOOK_SECRET) {
+    return res.sendStatus(403);
+  }
 
-    try {
-        const update = req.body;
-        if (update.message && update.message.reply_to_message && update.message.text) {
-            const replyToId = update.message.reply_to_message.message_id;
-            const adminReplyText = update.message.text;
+  try {
+    const update = req.body;
+    const message = update.message;
 
-            console.log(`🔍 Шукаю сесію для message_id: ${replyToId}`);
-            const sessionId = sessions.get(replyToId);
-            
-            if (sessionId) {
-                console.log(`✨ Знайдено сесію! Додаю відповідь для ${sessionId}: "${adminReplyText}"`);
-                if (!global.pendingMessages.has(sessionId)) {
-                    global.pendingMessages.set(sessionId, []);
-                }
-                global.pendingMessages.get(sessionId).push(adminReplyText);
-            } else {
-                console.log(`⚠️ Сесію для message_id ${replyToId} не знайдено в пам'яті! (Можливо, сервер перезавантажувався).`);
-            }
-        }
-        res.status(200).send('OK');
-    } catch (err) {
-        console.error('❌ Помилка у вебхуці:', err);
-        res.status(500).send('Error');
+    if (!message?.text ||
+        String(message.chat?.id) !== CHAT_ID ||
+        !message.reply_to_message?.text) {
+      return res.sendStatus(200);
     }
+
+    const originalText = message.reply_to_message.text;
+    const match = originalText.match(/\[SID:([a-zA-Z0-9_-]{1,80})\]/);
+
+    if (!match) {
+      return res.sendStatus(200);
+    }
+
+    const sessionId = match[1];
+    const replyText = message.text.trim();
+
+    if (!replyText) {
+      return res.sendStatus(200);
+    }
+
+    if (!pendingMessages.has(sessionId)) {
+      pendingMessages.set(sessionId, []);
+    }
+
+    pendingMessages.get(sessionId).push({
+      id: update.update_id,
+      text: replyText
+    });
+
+    console.log("Telegram reply received for session:", sessionId);
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error("telegram-webhook error:", error.message);
+    return res.sendStatus(500);
+  }
 });
 
-// 3. Перевірка нових повідомлень сайтом
-app.get('/api/check-messages/:sessionId', (req, res) => {
-    const sessionId = req.params.sessionId;
-    if (global.pendingMessages.has(sessionId)) {
-        const messages = global.pendingMessages.get(sessionId);
-        global.pendingMessages.delete(sessionId);
-        return res.json({ messages });
-    }
-    return res.json({ messages: [] });
+// 3. Сайт отримує відповіді для конкретної сесії
+app.get("/api/check-messages/:sessionId", (req, res) => {
+  const sessionId = req.params.sessionId;
+
+  if (!validSessionId(sessionId)) {
+    return res.status(400).json({ messages: [] });
+  }
+
+  const messages = pendingMessages.get(sessionId) || [];
+
+  pendingMessages.delete(sessionId);
+
+  // Залишаємо сумісність із віджетом, який очікує масив текстів.
+  return res.json({
+    messages: messages.map(message => message.text)
+  });
 });
 
-app.get('/', (req, res) => {
-    res.json({ status: "EL-Księgowość Chat Bridge is running!" });
+// 4. Одноразове налаштування Telegram webhook
+app.get("/api/setup-webhook", async (req, res) => {
+  if (!SETUP_KEY || req.query.key !== SETUP_KEY) {
+    return res.sendStatus(403);
+  }
+
+  try {
+    if (!WEBHOOK_SECRET) {
+      return res.status(500).json({
+        success: false,
+        error: "TELEGRAM_WEBHOOK_SECRET is missing"
+      });
+    }
+
+    const baseUrl =
+      process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
+
+    if (!baseUrl) {
+      return res.status(500).json({
+        success: false,
+        error: "Render public URL is missing"
+      });
+    }
+
+    await telegram("setWebhook", {
+      url: `${baseUrl.replace(/\/$/, "")}/api/telegram-webhook`,
+      secret_token: WEBHOOK_SECRET,
+      allowed_updates: ["message"]
+    });
+
+    return res.json({ success: true, webhookConfigured: true });
+  } catch (error) {
+    console.error("setup-webhook error:", error.message);
+
+    return res.status(502).json({
+      success: false,
+      error: "Не вдалося налаштувати Telegram webhook"
+    });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.json({ status: "EL-Księgowość Chat Bridge is running!" });
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-    console.log(`Bridge server is running on port ${PORT}`);
+  console.log(`EL-Księgowość Chat Bridge listening on ${PORT}`);
 });
